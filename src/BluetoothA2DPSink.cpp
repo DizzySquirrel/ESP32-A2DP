@@ -652,6 +652,9 @@ void BluetoothA2DPSink::handle_audio_state(uint16_t event, void *p_param) {
     if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
       set_i2s_active(true);
     } else if (ESP_A2D_AUDIO_STATE_SUSPEND == a2d->audio_stat.state) {
+       // flush silence through DMA before deactivating to avoid a noise pop
+       if (is_output && is_i2s_active)
+         out->writeSilence(2 * 1024);
        // deactivate only when is_output_active_by_state is true
        if (is_output_active_by_state) set_i2s_active(false);
     }
