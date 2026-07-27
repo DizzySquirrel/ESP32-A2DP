@@ -30,7 +30,7 @@ class BluetoothA2DPOutput {
   virtual void writeSilence(size_t len) {
     uint8_t silence[64] = {};
     for (size_t i = 0; i < len; i += sizeof(silence))
-      write(silence, min(sizeof(silence), len - i));
+      write(silence, std::min(sizeof(silence), len - i));
   }
 
 #if A2DP_I2S_AUDIOTOOLS
