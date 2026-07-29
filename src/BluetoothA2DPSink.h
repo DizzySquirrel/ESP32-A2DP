@@ -19,6 +19,7 @@
 
 #include "BluetoothA2DPOutput.h"
 #include "freertos/ringbuf.h"
+#include "A2DPDecoder.h"
 
 // Comment out next line to deactivate warnings
 #ifndef A2DP_I2S_AUDIOTOOLS
@@ -48,22 +49,14 @@ extern "C" void ccall_i2s_task_handler(void* arg);
 extern "C" void ccall_audio_data_callback(const uint8_t* data, uint32_t len);
 extern "C" void ccall_av_hdl_a2d_evt(uint16_t event, void* p_param);
 extern "C" void ccall_av_hdl_avrc_evt(uint16_t event, void* p_param);
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-extern "C" void ccall_audio_encoded_callback(esp_a2d_conn_hdl_t conn_hdl,
-                                             esp_a2d_audio_buff_t* audio_buf);
+#if A2DP_MANAGED_DECODER_SUPPORTED
+extern "C" void ccall_audio_managed_decode_callback(
+    esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_t* audio_buf);
+extern "C" void ccall_managed_decode_task_handler(void* arg);
 #endif
 
 /// defines the mechanism to confirm a pin request
 enum PinCodeRequest { Undefined, Confirm, Reply };
-
-/// Supported codec selection for SEP registration (some may not be fully
-/// implemented in IDF)
-enum A2DPCodec {
-  A2DP_CODEC_SBC,
-  A2DP_CODEC_M12,
-  A2DP_CODEC_AAC,
-  A2DP_CODEC_ATRAC
-};
 
 // provide global ref for callbacks
 class BluetoothA2DPSink;
@@ -86,7 +79,7 @@ extern BluetoothA2DPSink* actual_bluetooth_a2dp_sink;
  *   - Automatic reconnection logic with configurable retry count
  *   - AVRCP (remote control) support for playback and volume commands
  *   - RSSI (signal strength) reporting and peer device name retrieval
- *   - Codec selection and encoded audio callback (ESP-IDF 5.5+)
+ *   - Optional managed multi-codec decoding via add_decoder() (ESP-IDF 5.5+)
  *   - Mono downmix, channel swap, and sample rate/channel introspection
  *   - Extensible for custom output, event handling, and platform integration
  *
@@ -112,9 +105,11 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   friend void ccall_av_hdl_a2d_evt(uint16_t event, void* p_param);
   /// avrc event handler
   friend void ccall_av_hdl_avrc_evt(uint16_t event, void* p_param);
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-  friend void ccall_audio_encoded_callback(esp_a2d_conn_hdl_t conn_hdl,
-                                           esp_a2d_audio_buff_t* audio_buf);
+#if A2DP_MANAGED_DECODER_SUPPORTED
+  friend void ccall_audio_managed_decode_callback(
+      esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_t* audio_buf);
+  friend void ccall_managed_decode_task_handler(void* arg);
+  friend void a2dp_decoder_audio_info_changed(audio_tools::AudioInfo info);
 #endif
 
  public:
@@ -212,12 +207,21 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   /// Determine the actual audio type
   virtual esp_a2d_mct_t get_audio_type();
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-  /// DRAFT: select codec AND set encoded frame callback in one call.
-  /// If encoded_cb is not nullptr it registers the encoded frame reader.
-  /// Returns result of internal registration
-  bool set_codec(A2DPCodec codec,
-                 void (*encoded_cb)(const uint8_t* data, size_t len) = nullptr);
+#if A2DP_MANAGED_DECODER_SUPPORTED
+  /// Registers a decoder (e.g. A2DPDecoderSBC, A2DPDecoderAAC) that decodes
+  /// the still-encoded frames delivered by the stack into PCM, which is
+  /// then forwarded through the normal decoded-output pipeline (volume,
+  /// stream_reader, write_audio) exactly like the built-in SBC path. Each
+  /// added decoder registers its own stream endpoint - which codecs
+  /// actually get negotiated depends entirely on what you've registered
+  /// here plus what the connected source and ESP-IDF version support.
+  /// Returns false if a decoder for that codec type is already registered.
+  bool add_decoder(A2DPDecoder& decoder) { return audio_decoder.add_decoder(decoder); }
+
+  /// MIME type of the currently selected/active decoder (e.g. "audio/sbc",
+  /// "audio/aac"), or "" if none is active yet (e.g. before a source has
+  /// connected and negotiated a codec)
+  const char* mime() { return audio_decoder.mime(); }
 #endif
 
   /// Define a callback method which provides connection state of AVRC service
@@ -471,7 +475,6 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   void (*bt_connected)() = nullptr;
   void (*data_received)() = nullptr;
   void (*stream_reader)(const uint8_t*, uint32_t) = nullptr;
-  void (*encoded_stream_reader)(const uint8_t*, size_t) = nullptr;
   void (*raw_stream_reader)(const uint8_t*, uint32_t) = nullptr;
   void (*avrc_connection_state_callback)(bool connected) = nullptr;
   void (*avrc_metadata_callback)(uint8_t, const uint8_t*) = nullptr;
@@ -501,9 +504,17 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap = {0};
   char remote_name[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
 #endif
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-  A2DPCodec desired_codec = A2DP_CODEC_SBC;
-  esp_a2d_mcc_t mcc{};
+#if A2DP_MANAGED_DECODER_SUPPORTED
+  // registers a stream endpoint per decoder added via add_decoder() and
+  // decodes whichever codec the source negotiates into PCM, transparently
+  // to the app, using audio_tools decoders (see A2DPDecoder.h)
+  A2DPAudioDecoder audio_decoder;
+  QueueHandle_t codec_raw_queue = nullptr;
+  TaskHandle_t codec_decode_task_handle = nullptr;
+  /// true when the managed decode path should be used instead of the
+  /// legacy decoded-only path: requires at least one decoder to have been
+  /// registered via add_decoder()
+  bool use_managed_decoder() { return audio_decoder.has_decoders(); }
 #endif
 
   void app_gap_callback(esp_bt_gap_cb_event_t event,
@@ -550,6 +561,13 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   virtual void handle_audio_state(uint16_t event, void* p_param);
   virtual void handle_audio_cfg(uint16_t event, void* p_param);
   virtual void handle_avrc_connection_state(bool connected);
+  /// updates m_sample_rate/m_channels, notifies sample_rate_callback and
+  /// the output - shared by the legacy SBC-only path (handle_audio_cfg)
+  /// and the managed decoder path (managed_decode_task_handler)
+  virtual void apply_audio_info(int sample_rate, int channels);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+  virtual void handle_sep_reg_state(uint16_t event, void* p_param);
+#endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
   /// Get the name of the connected source device (obsolete): use
@@ -582,6 +600,20 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   virtual void bt_i2s_task_start_up(void) {}
   virtual void bt_i2s_task_shut_down(void) {}
 
+#if A2DP_MANAGED_DECODER_SUPPORTED
+  /// registers one stream endpoint per decoder added via add_decoder() and
+  /// the raw-frame callback, called from av_hdl_stack_evt() when
+  /// use_managed_decoder()
+  virtual void register_managed_decoder_seps();
+  /// creates the raw queue + decode task, called on ESP_A2D_AUDIO_STATE_STARTED
+  virtual void managed_decode_start();
+  /// suspends the decode task, drains the raw queue and closes the decoder,
+  /// called on ESP_A2D_AUDIO_STATE_SUSPEND / disconnect
+  virtual void managed_decode_flush();
+  /// task loop: pulls raw encoded buffers off codec_raw_queue and decodes them
+  virtual void managed_decode_task_handler(void* arg);
+#endif
+
   esp_err_t esp_a2d_connect(esp_bd_addr_t peer) override {
     return esp_a2d_sink_connect(peer);
   }
@@ -596,8 +628,6 @@ class BluetoothA2DPSink : public BluetoothA2DPCommon {
   virtual void set_i2s_active(bool active);
 
   virtual bool isSource() { return false; }
-
-  bool is_encoded_output() { return encoded_stream_reader != nullptr; }
 };
 
 #endif  // platform

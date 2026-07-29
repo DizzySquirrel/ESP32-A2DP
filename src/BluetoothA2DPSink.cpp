@@ -15,7 +15,17 @@
 
 #include "BluetoothA2DPSink.h"
 
+
 #if IS_VALID_PLATFORM
+
+// Defines to support older IDF versions that don't have these defines yet
+#ifndef ESP_A2D_SBC_CIE_SF_32K
+#  define ESP_A2D_SBC_CIE_SF_32K                  (0x4)       /*!< SBC sampling frequency 32kHz */
+#endif
+#ifndef ESP_A2D_SBC_CIE_SF_16K
+#  define ESP_A2D_SBC_CIE_SF_16K                  (0x8)       /*!< SBC sampling frequency 16kHz  */
+#endif
+
 
 // to support static callback functions
 BluetoothA2DPSink *actual_bluetooth_a2dp_sink;
@@ -46,19 +56,30 @@ extern "C" void ccall_av_hdl_a2d_evt(uint16_t event, void *param) {
   }
 }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-extern "C" void ccall_audio_encoded_callback(esp_a2d_conn_hdl_t conn_hdl,
-                                             esp_a2d_audio_buff_t *audio_buf) {
-  ESP_LOGI(BT_AV_TAG, "ccall_audio_encoded_callback");
+#if A2DP_MANAGED_DECODER_SUPPORTED
+extern "C" void ccall_audio_managed_decode_callback(
+    esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_t *audio_buf) {
+  if (audio_buf == nullptr) return;
   if (actual_bluetooth_a2dp_sink &&
-      actual_bluetooth_a2dp_sink->encoded_stream_reader && audio_buf) {
-    // pass raw encoded bytes
-    ESP_LOGI(BT_AV_TAG, "encoded_stream_reader=%d", (int)audio_buf->data_len);
-    actual_bluetooth_a2dp_sink->encoded_stream_reader(audio_buf->data,
-                                                      audio_buf->data_len);
+      actual_bluetooth_a2dp_sink->codec_raw_queue != nullptr) {
+    if (xQueueSend(actual_bluetooth_a2dp_sink->codec_raw_queue, &audio_buf, 0) ==
+        pdTRUE) {
+      return;
+    }
+    ESP_LOGW(BT_AV_TAG, "managed decode raw queue full, dropping packet");
   }
-  if (audio_buf) {
-    esp_a2d_audio_buff_free(audio_buf);
+  esp_a2d_audio_buff_free(audio_buf);
+}
+
+extern "C" void ccall_managed_decode_task_handler(void *arg) {
+  if (actual_bluetooth_a2dp_sink)
+    actual_bluetooth_a2dp_sink->managed_decode_task_handler(arg);
+}
+
+void a2dp_decoder_audio_info_changed(audio_tools::AudioInfo info) {
+  if (actual_bluetooth_a2dp_sink) {
+    actual_bluetooth_a2dp_sink->apply_audio_info(info.sample_rate,
+                                                 info.channels);
   }
 }
 #endif
@@ -217,44 +238,83 @@ void BluetoothA2DPSink::init_i2s() {
 
 esp_a2d_mct_t BluetoothA2DPSink::get_audio_type() { return audio_type; }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+#if A2DP_MANAGED_DECODER_SUPPORTED
 
-bool BluetoothA2DPSink::set_codec(A2DPCodec codec,
-                                  void (*encoded_cb)(const uint8_t* data,
-                                                     size_t len)) {
-  encoded_stream_reader = encoded_cb;
-  ESP_LOGI(BT_AV_TAG, "set_codec() called with codec=%d", codec);
-  is_output = false;
-  desired_codec = codec;
-  ESP_LOGD(BT_AV_TAG, "set_codec: preparing mcc struct");
-  switch (codec) {
-    case A2DP_CODEC_SBC:
-      mcc.type = ESP_A2D_MCT_SBC;
-      mcc.cie.sbc_info.samp_freq =
-          ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K;
-      mcc.cie.sbc_info.ch_mode =
-          ESP_A2D_SBC_CIE_CH_MODE_STEREO | ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
-      mcc.cie.sbc_info.block_len = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
-      mcc.cie.sbc_info.alloc_mthd =
-          ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
-      mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
-      mcc.cie.sbc_info.min_bitpool = 2;
-      mcc.cie.sbc_info.max_bitpool = 250;
-      break;
-    case A2DP_CODEC_M12:
-      mcc.type = ESP_A2D_MCT_M12;  // may not be supported
-      break;
-    case A2DP_CODEC_AAC:
-      mcc.type = ESP_A2D_MCT_M24;  // AAC (MPEG-2/4) - may not be supported
-      break;
-    case A2DP_CODEC_ATRAC:
-      mcc.type = ESP_A2D_MCT_ATRAC;  // may not be supported
-      break;
+void BluetoothA2DPSink::register_managed_decoder_seps() {
+  uint8_t seid = 0;
+  for (A2DPDecoder *dec : audio_decoder.all_decoders()) {
+    esp_a2d_mcc_t mcc = {0};
+    dec->build_capability(mcc);
+    esp_err_t err = esp_a2d_sink_register_stream_endpoint(seid, &mcc);
+    ESP_LOGI(BT_AV_TAG,
+             "stack_up: register_stream_endpoint(codec type %d, seid %d) = %d",
+             (int)dec->codec_type(), (int)seid, (int)err);
+    seid++;
   }
-  return true;
+
+  esp_err_t cb_err =
+      esp_a2d_sink_register_audio_data_callback(ccall_audio_managed_decode_callback);
+  if (cb_err != ESP_OK) {
+    ESP_LOGE(BT_AV_TAG,
+             "stack_up: esp_a2d_sink_register_audio_data_callback failed: %d",
+             (int)cb_err);
+  }
 }
 
-#endif
+void BluetoothA2DPSink::managed_decode_start() {
+  if (codec_decode_task_handle != nullptr) return;  // already started
+
+  codec_raw_queue = xQueueCreate(A2DP_MANAGED_DECODE_Q_DEPTH,
+                                 sizeof(esp_a2d_audio_buff_t *));
+  if (codec_raw_queue == nullptr) {
+    ESP_LOGE(BT_AV_TAG, "managed_decode_start: raw queue create failed");
+    return;
+  }
+  if (xTaskCreate(ccall_managed_decode_task_handler, "a2dp_managed_dec",
+                  A2DP_MANAGED_DECODE_TASK_STACK, nullptr,
+                  A2DP_MANAGED_DECODE_TASK_PRIO,
+                  &codec_decode_task_handle) != pdPASS) {
+    vQueueDelete(codec_raw_queue);
+    codec_raw_queue = nullptr;
+    codec_decode_task_handle = nullptr;
+    ESP_LOGE(BT_AV_TAG, "managed_decode_start: decode task create failed");
+    return;
+  }
+  ESP_LOGI(BT_AV_TAG, "managed_decode_start: started (queue depth %d)",
+           A2DP_MANAGED_DECODE_Q_DEPTH);
+}
+
+void BluetoothA2DPSink::managed_decode_flush() {
+  if (codec_decode_task_handle != nullptr) {
+    vTaskSuspend(codec_decode_task_handle);
+  }
+  if (codec_raw_queue != nullptr) {
+    esp_a2d_audio_buff_t *audio_buf;
+    while (xQueueReceive(codec_raw_queue, &audio_buf, 0) == pdTRUE) {
+      esp_a2d_audio_buff_free(audio_buf);
+    }
+  }
+  // close the decoder while the task is still suspended, so it can't be
+  // concurrently mid-process() on the decoder being closed
+  audio_decoder.close();
+  if (codec_decode_task_handle != nullptr) {
+    vTaskResume(codec_decode_task_handle);
+  }
+}
+
+void BluetoothA2DPSink::managed_decode_task_handler(void *arg) {
+  // sample-rate/channel changes are picked up reactively, via
+  // a2dp_decoder_audio_info_changed() -> apply_audio_info(), as soon as the
+  // active decoder reports them - no need to poll for it here
+  esp_a2d_audio_buff_t *audio_buf;
+  for (;;) {
+    xQueueReceive(codec_raw_queue, &audio_buf, portMAX_DELAY);
+    audio_decoder.process(audio_buf->data, audio_buf->data_len);
+    esp_a2d_audio_buff_free(audio_buf);
+  }
+}
+
+#endif  // A2DP_MANAGED_DECODER_SUPPORTED
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
 const char *BluetoothA2DPSink::get_connected_source_name() {
@@ -526,6 +586,13 @@ void BluetoothA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
 
     } break;
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    case ESP_A2D_SEP_REG_STATE_EVT: {
+      ESP_LOGD(BT_AV_TAG, "%s ESP_A2D_SEP_REG_STATE_EVT", __func__);
+      handle_sep_reg_state(event, p_param);
+    } break;
+#endif
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
 
     case ESP_A2D_PROF_STATE_EVT: {
@@ -545,31 +612,34 @@ void BluetoothA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
   }
 }
 
-void BluetoothA2DPSink::handle_audio_cfg(uint16_t event, void *p_param) {
-  ESP_LOGD(BT_AV_TAG, "%s evt %d", __func__, event);
-  esp_a2d_cb_param_t *a2d = (esp_a2d_cb_param_t *)(p_param);
-  audio_type = a2d->audio_cfg.mcc.type;
-  ESP_LOGI(BT_AV_TAG, "a2dp audio_cfg_cb , codec type %d",
-           a2d->audio_cfg.mcc.type);
-
-  // determine sample rate
-  int sample_rate = 0;
+/// Parses sample rate + channel count out of a negotiated SBC capability.
+/// Leaves sample_rate at 0 if none of the known frequency bits matched
+/// (caller must treat that as "unknown", not 0 Hz). SBC is the only codec
+/// type this legacy pipeline decodes, so it's the only one parsed here -
+/// the managed decoder path (see A2DPDecoder.h) gets its sample
+/// rate/channels from the decoder itself instead.
+static void parse_sbc_audio_cfg(const esp_a2d_mcc_t &mcc, int &sample_rate,
+                                int &channels) {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
   // Use new sbc_info (avoid deprecated sbc[] array)
-  uint8_t sf = a2d->audio_cfg.mcc.cie.sbc_info.samp_freq;
-#ifdef ESP_A2D_SBC_CIE_SF_32K
-  if (sf & ESP_A2D_SBC_CIE_SF_32K) {
+  uint8_t sf = mcc.cie.sbc_info.samp_freq;
+  if (sf & ESP_A2D_SBC_CIE_SF_16K) {
+    sample_rate = 16000;
+  } else if (sf & ESP_A2D_SBC_CIE_SF_32K) {
     sample_rate = 32000;
-  } else
-#endif
-      if (sf & ESP_A2D_SBC_CIE_SF_44K) {
+  } else if (sf & ESP_A2D_SBC_CIE_SF_44K) {
     sample_rate = 44100;
   } else if (sf & ESP_A2D_SBC_CIE_SF_48K) {
     sample_rate = 48000;
   }
+  channels =
+      (mcc.cie.sbc_info.ch_mode == ESP_A2D_SBC_CIE_CH_MODE_MONO) ? 1 : 2;
+  ESP_LOGI(BT_AV_TAG, "configure audio player %x-%x-%x-%x",
+           (int)mcc.cie.sbc_info.samp_freq, (int)mcc.cie.sbc_info.ch_mode,
+           (int)mcc.cie.sbc_info.block_len, (int)mcc.cie.sbc_info.alloc_mthd);
 #else
-  // Legacy field parsing (older IDF)
-  char oct0 = a2d->audio_cfg.mcc.cie.sbc[0];
+  // Legacy field parsing (older IDF, no sbc_info struct yet)
+  char oct0 = mcc.cie.sbc[0];
   if (oct0 & (0x01 << 6)) {
     sample_rate = 32000;
   } else if (oct0 & (0x01 << 5)) {
@@ -577,56 +647,101 @@ void BluetoothA2DPSink::handle_audio_cfg(uint16_t event, void *p_param) {
   } else if (oct0 & (0x01 << 4)) {
     sample_rate = 48000;
   }
+  // octet 1 bits 0..3 represent channel mode; only one is set (mono bit3,
+  // dual bit2, stereo bit1, joint bit0 per the A2DP spec)
+  uint8_t oct1 = mcc.cie.sbc[1];
+  channels = (oct1 & 0x08) ? 1 : 2;
+  ESP_LOGI(BT_AV_TAG, "configure audio player %x-%x-%x-%x", (int)mcc.cie.sbc[0],
+           (int)mcc.cie.sbc[1], (int)mcc.cie.sbc[2], (int)mcc.cie.sbc[3]);
+#endif
+}
+
+void BluetoothA2DPSink::apply_audio_info(int sample_rate, int channels) {
+  m_sample_rate = sample_rate;
+  m_channels = channels;
+  ESP_LOGI(BT_AV_TAG, "audio info: sample_rate %d, channels %d", sample_rate,
+           channels);
+  if (sample_rate_callback != nullptr) {
+    sample_rate_callback(m_sample_rate);
+  }
+  out->set_sample_rate(m_sample_rate);
+}
+
+void BluetoothA2DPSink::handle_audio_cfg(uint16_t event, void *p_param) {
+  ESP_LOGD(BT_AV_TAG, "%s evt %d", __func__, event);
+  esp_a2d_cb_param_t *a2d = (esp_a2d_cb_param_t *)(p_param);
+  audio_type = a2d->audio_cfg.mcc.type;
+  ESP_LOGI(BT_AV_TAG, "a2dp audio_cfg_cb , codec type %d", (int)audio_type);
+
+#if A2DP_MANAGED_DECODER_SUPPORTED
+  if (use_managed_decoder()) {
+    // selects and opens the decoder registered for the negotiated codec
+    // type; sample_rate()/channels() aren't known yet at this point - the
+    // decoder self-detects them from the actual encoded stream once frames
+    // start flowing, picked up in managed_decode_task_handler()
+    //
+    // A2DP allows the source to send a new AUDIO_CFG_EVT mid-stream
+    // (codec renegotiation without a disconnect); if the decode task is
+    // already running at that point, suspend it while apply_mcc() closes
+    // the old decoder and opens the new one, so it can't be concurrently
+    // calling process() on a decoder that's being swapped out from under it
+    if (codec_decode_task_handle != nullptr) {
+      vTaskSuspend(codec_decode_task_handle);
+    }
+    audio_decoder.apply_mcc(&a2d->audio_cfg.mcc);
+    if (codec_decode_task_handle != nullptr) {
+      vTaskResume(codec_decode_task_handle);
+    }
+    return;
+  }
 #endif
 
-  // for now only SBC stream is supported
-  if (a2d->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
-    // determine channel count from negotiated SBC channel mode
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-    uint8_t ch_mode = a2d->audio_cfg.mcc.cie.sbc_info.ch_mode;
-    if (ch_mode == ESP_A2D_SBC_CIE_CH_MODE_MONO) {
-      m_channels = 1;
-    } else {
-      m_channels = 2;  // dual/stereo/joint are all rendered as 2 channels
-    }
-#else
-    // legacy parsing: octet 1 bits 0..3 represent channel mode; only one is set
-    uint8_t oct1 = a2d->audio_cfg.mcc.cie.sbc[1];
-    // Bit masks per A2DP spec for channel mode (mono bit3, dual bit2, stereo
-    // bit1, joint bit0)
-    if (oct1 & 0x08) {
-      m_channels = 1;  // mono
-    } else {
-      m_channels = 2;  // any other mode
-    }
-#endif
-    ESP_LOGI(BT_AV_TAG, "a2dp audio_cfg_cb , channels %d", m_channels);
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-    ESP_LOGI(BT_AV_TAG, "configure audio player %x-%x-%x-%x\n",
-             (int)a2d->audio_cfg.mcc.cie.sbc_info.samp_freq,
-             (int)a2d->audio_cfg.mcc.cie.sbc_info.ch_mode,
-             (int)a2d->audio_cfg.mcc.cie.sbc_info.block_len,
-             (int)a2d->audio_cfg.mcc.cie.sbc_info.alloc_mthd);
-#else
-    ESP_LOGI(
-        BT_AV_TAG, "configure audio player %x-%x-%x-%x\n",
-        (int)a2d->audio_cfg.mcc.cie.sbc[0], (int)a2d->audio_cfg.mcc.cie.sbc[1],
-        (int)a2d->audio_cfg.mcc.cie.sbc[2], (int)a2d->audio_cfg.mcc.cie.sbc[3]);
-#endif
-
-    ESP_LOGI(BT_AV_TAG, "a2dp audio_cfg_cb , sample_rate %u", m_sample_rate);
+  if (audio_type != ESP_A2D_MCT_SBC) {
+    // non-SBC codec types (e.g. AAC) are not decoded by this legacy
+    // pipeline; sample_rate()/channels() keep their previous/default values
+    ESP_LOGI(BT_AV_TAG,
+             "a2dp audio_cfg_cb , codec type %d is not parsed by this "
+             "pipeline - sample_rate/channels left unchanged",
+             (int)audio_type);
+    return;
   }
 
-  // inform caller about new values
+  int sample_rate = 0;
+  int channels = m_channels;
+  parse_sbc_audio_cfg(a2d->audio_cfg.mcc, sample_rate, channels);
   if (sample_rate != 0) {
-    m_sample_rate = sample_rate;
-    // act on determined data
-    if (sample_rate_callback != nullptr) {
-      sample_rate_callback(m_sample_rate);
-    }
-    out->set_sample_rate(m_sample_rate);
+    apply_audio_info(sample_rate, channels);
+  } else {
+    m_channels = channels;
   }
 }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void BluetoothA2DPSink::handle_sep_reg_state(uint16_t event, void *p_param) {
+  esp_a2d_cb_param_t *a2d = (esp_a2d_cb_param_t *)(p_param);
+  uint8_t seid = a2d->a2d_sep_reg_stat.seid;
+  switch (a2d->a2d_sep_reg_stat.reg_state) {
+    case ESP_A2D_SEP_REG_SUCCESS:
+      ESP_LOGI(BT_AV_TAG, "SEP registration for seid %d succeeded", seid);
+      break;
+    case ESP_A2D_SEP_REG_UNSUPPORTED:
+      ESP_LOGE(BT_AV_TAG,
+               "SEP registration for seid %d failed: codec type not "
+               "supported by this ESP-IDF version (AAC/M12/ATRAC SEP "
+               "registration requires ESP-IDF >= 6.1)",
+               seid);
+      break;
+    case ESP_A2D_SEP_REG_INVALID_STATE:
+      ESP_LOGE(BT_AV_TAG,
+               "SEP registration for seid %d failed: invalid state", seid);
+      break;
+    case ESP_A2D_SEP_REG_FAIL:
+    default:
+      ESP_LOGE(BT_AV_TAG, "SEP registration for seid %d failed", seid);
+      break;
+  }
+}
+#endif
 
 void BluetoothA2DPSink::handle_avrc_connection_state(bool connected) {
   ESP_LOGD(BT_AV_TAG, "%s state %d", __func__, connected);
@@ -647,17 +762,19 @@ void BluetoothA2DPSink::handle_audio_state(uint16_t event, void *p_param) {
     audio_state_callback(a2d->audio_stat.state, audio_state_obj);
   }
 
-  // Update I2s only when decoded output
-  if (!is_encoded_output()) {
-    if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
-      set_i2s_active(true);
-    } else if (ESP_A2D_AUDIO_STATE_SUSPEND == a2d->audio_stat.state) {
-       // flush silence through DMA before deactivating to avoid a noise pop
-       if (is_output && is_i2s_active)
-         out->write_silence(2 * 1024);
-       // deactivate only when is_output_active_by_state is true
-       if (is_output_active_by_state) set_i2s_active(false);
-    }
+  if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
+#if A2DP_MANAGED_DECODER_SUPPORTED
+    if (use_managed_decoder()) managed_decode_start();
+#endif
+    set_i2s_active(true);
+  } else if (ESP_A2D_AUDIO_STATE_SUSPEND == a2d->audio_stat.state) {
+    // flush silence through DMA before deactivating to avoid a noise pop
+    if (is_output && is_i2s_active) out->write_silence(2 * 1024);
+    // deactivate only when is_output_active_by_state is true
+    if (is_output_active_by_state) set_i2s_active(false);
+#if A2DP_MANAGED_DECODER_SUPPORTED
+    if (use_managed_decoder()) managed_decode_flush();
+#endif
   }
 
   if (audio_state_callback_post != nullptr) {
@@ -709,6 +826,10 @@ void BluetoothA2DPSink::handle_connection_state(uint16_t event, void *p_param) {
       // reset pin code
       pin_code_int = 0;
       pin_code_request = Undefined;
+
+#if A2DP_MANAGED_DECODER_SUPPORTED
+      if (use_managed_decoder()) managed_decode_flush();
+#endif
 
       // call callback
       if (bt_dis_connected != nullptr) {
@@ -1047,45 +1168,28 @@ void BluetoothA2DPSink::av_hdl_stack_evt(uint16_t event, void* p_param) {
         ESP_LOGE(BT_AV_TAG, "esp_a2d_register_callback");
       }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-      // For encoded data: register stream endpoint BEFORE sink init
-      if (is_encoded_output()) {
-        ESP_LOGI(BT_AV_TAG,
-                 "stack_up: encoded_stream_reader=%p "
-                 "desired_codec=%d",
-                 (void*)encoded_stream_reader,
-                 (int)desired_codec);
-        // Register at index 1 (index 0 is reserved for default)
-        esp_err_t err = esp_a2d_sink_register_stream_endpoint(0, &mcc);
-        ESP_LOGI(BT_AV_TAG,
-                 "stack_up: esp_a2d_sink_register_stream_endpoint(1) returned %d",
-                 (int)err);
-        if (err == ESP_OK) {
-          esp_err_t cb_err = esp_a2d_sink_register_audio_data_callback(
-              ccall_audio_encoded_callback);
-          ESP_LOGI(BT_AV_TAG,
-                   "stack_up: esp_a2d_sink_register_audio_data_callback "
-                   "returned %d",
-                   (int)cb_err);
-          if (cb_err != ESP_OK) {
-            ESP_LOGE(BT_AV_TAG, "Failed to register encoded audio callback");
-          }
-        } else {
-          ESP_LOGE(BT_AV_TAG, "Failed to register SEP codec %d err=%d",
-                   mcc.type, err);
-        }
+#if A2DP_MANAGED_DECODER_SUPPORTED
+      // register one stream endpoint per decoder added via add_decoder(),
+      // and decode whichever gets negotiated using the registered
+      // audio_tools decoders
+      if (use_managed_decoder()) {
+        register_managed_decoder_seps();
       }
 #endif
 
-
-      // For decoded data: register callback after sink init
-      if (!is_encoded_output()) {
+      // Legacy decoded-data path: only used when the managed decoder path
+      // (add_decoder()) is not active
+#if A2DP_MANAGED_DECODER_SUPPORTED
+      if (!use_managed_decoder()) {
+#endif
         ESP_LOGI(BT_AV_TAG, "stack_up: registering decoded data callback");
         if (esp_a2d_sink_register_data_callback(ccall_audio_data_callback) !=
             ESP_OK) {
           ESP_LOGE(BT_AV_TAG, "esp_a2d_sink_register_data_callback");
         }
+#if A2DP_MANAGED_DECODER_SUPPORTED
       }
+#endif
 
       // initialize A2DP sink
       if (esp_a2d_sink_init() != ESP_OK) {
@@ -1134,6 +1238,15 @@ void BluetoothA2DPSink::app_a2d_callback(esp_a2d_cb_event_t event,
                         sizeof(esp_a2d_cb_param_t));
       break;
     }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    case ESP_A2D_SEP_REG_STATE_EVT: {
+      ESP_LOGD(BT_AV_TAG, "%s ESP_A2D_SEP_REG_STATE_EVT", __func__);
+      app_work_dispatch(ccall_av_hdl_a2d_evt, event, param,
+                        sizeof(esp_a2d_cb_param_t));
+      break;
+    }
+#endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
     case ESP_A2D_PROF_STATE_EVT: {
